@@ -1,46 +1,194 @@
 import torch
-# import torch.optim as optim
+import torch.optim as optim
+from collections import deque
+# import numpy as np
+import math
 
 
+def deal_with_scaling(scaling):
+    """ Figure out upper and lower bound when scaling is a tuple or a scalar
+    """
+    scale = scaling
+    if isinstance(scale, tuple):
+        if len(scale) > 2:
+            raise ValueError(
+                f"Length of tuple too long. Expected 1 or 2 got {len(scale)}")
+        elif len(scale) == 1:
+            scale = scale[0]  # pass to float below
+        else:
+            sort_scale = sorted(scale)
+            if 0 < sort_scale[0] < 1 and sort_scale[1] > 1:
+                downscale, upscale = sort_scale
+            else:
+                raise ValueError("Invalid scaling values")
 
-class VA_wrapper():
+    if isinstance(scale, float):
+        if 0 < scale and scale < 1:
+            downscale = scale
+            upscale = 1 / scale
+        elif 1 < scale:
+            downscale = 1 / scale
+            upscale = scale
+        else:
+            raise ValueError("Scaling must be positive")
+
+    return downscale, upscale
+
+#############
+# Correction terms for various optimizers
+############
+
+#
+# def sgd_correction(self, group):
+#     beta = group['momentum']
+#     if beta == 0:
+#         # correction_term = torch.tensor(1.0)
+#         correction_term =1.0
+#     else:
+#         t = self.state['step']
+#         # c =(1.0-beta**t)/(1.0-beta)
+#         # correction_term = c
+#         correction_term = 1.0
+#
+#
+#     return torch.tensor(correction_term)
+#
+#
+# def standard_correction(self, group):
+#     return torch.tensor(1.0)
+#
+#
+# def adam_correction(self, group):
+#     beta1, beta2 = group['betas']
+#     t = self.state['step']
+#
+#     # correction_term = (1 - beta1**t)
+#
+#     # correction_term = (1 - beta1)
+#     correction_term=1.0
+#
+#     return torch.tensor(correction_term)
+#     # return torch.tensor(1.0)
+
+
+#################
+# Pointers to gradient estimates
+#################
+
+# def standard_grad(self, p):
+#     return p.grad
+#
+#
+# def sgd_grad(self, p):
+#     if 'momentum_buffer' in self.optimizer.state[p]:
+#         # return self.optimizer.state[p]['momentum_buffer']
+#         return p.grad
+#     else:
+#         return p.grad
+#
+#
+# def adam_grad(self, p):
+#     # return p
+#     # return self.optimizer.state[p]['exp_avg']
+#     return p.grad
+
+
+##################
+# get handle to correction term and gradient estimate
+##################
+# def get_optimizer_properties(opt):
+#     opt_name = opt.__class__.__name__
+#     # print(opt_name)
+#     # print(opt.param_groups[0])
+#     if opt_name == 'SGD':
+#         return sgd_correction, sgd_grad
+#
+#     elif opt_name in set(('RMSprop', 'Adagrad')):
+#         return standard_correction, standard_grad
+#
+#     elif opt_name == 'Adam':
+#         return adam_correction, adam_grad
+#
+#     else:
+#         raise NotImplemented(
+#             "The requested optimizer is not added to the index")
+
+
+class QuadraticAdaptation():
     ''' Wrapper that iteratively update the learning rate of standard optimizers
     in pytorch according to a quadratic approximation.
     '''
 
-    def __init__(self, optimizer, scale=(0.5, 1.2), eps=1e-12):
+    def __init__(self, optimizer, scale=(0.75, 1.25), eps=1e-12, verbose=False):
         """
         Wrapper requires:
-        - A Pytorch optimizer  
-        - scale for increasing and decreasing the learning rate
+        scale: scaling to apply when lr too small/large  
         """
-        if not 0.0 < scale[0] <= 1.0:
-            raise ValueError("Invalid scale parameter at index 0: {}".format(scale[0]))
-
-        if not 1.0 <= scale[1]:
-            raise ValueError("Invalid scale parameter at index 1: {}".format(scale[1]))
-        
-        if not 0.0 < eps:
-            raise ValueError("Invalid eps parameter: {}".format(eps))
 
         self.optimizer = optimizer
-
+        if len(optimizer.param_groups) > 1:
+            raise NotImplementedError(
+                "Several parameter groups not yet implemented")
 
         self.state = dict(eps=eps)
+
         self.defaults = {"scale":scale,**self.optimizer.defaults}
 
         # Update name to highlight adaptation
-        self.__name__ = 'a-' + optimizer.__class__.__name__
+        self.__name__ = 'adapted_' + optimizer.__class__.__name__
 
-        self.state['downscale'] = scale[0]
-        self.state['upscale'] = scale[1]
+        downscale, upscale = deal_with_scaling(scale)
+
+        self.state['downscale'] = downscale
+        self.state['upscale'] = upscale
+        self.state['step'] = 0
+
 
         # Keep track of scaling
         self.state['accumulated_scaling'] = torch.tensor(
             1.0, requires_grad=False)
 
-        self.state['R'] = torch.tensor(
-            0.0, requires_grad=False)
+        self.parameter_copy = {}
+        self.save_parameters(zero_data=False)
+        self.inner_prod = torch.zeros(1,requires_grad=False)
+
+
+        # Tensors for storing short term accumulated information
+        # self.state['l_acc'] = torch.tensor(0.0, requires_grad=False)
+        # self.state['l_acc_squared'] = torch.tensor(0.0, requires_grad=False)
+        # self.state['delta_acc'] = torch.tensor(0.0, requires_grad=False)
+        # self.state['M'] = M
+        # self.state['R'] = torch.tensor(
+        #     0.0, requires_grad=False)
+
+        # Identify optimizer and get handles to gradient estimate
+        # correction_term is identity for all implemented optimizers except Adam
+        # self._correction_term_handle, self._gradient_estimate_handle = get_optimizer_properties(
+        #     optimizer)
+        # self._correction_term_handle, self._gradient_estimate_handle = get_optimizer_properties(
+        #     optimizer)
+
+        self.VERBOSE = verbose
+
+    # def correction_term(self, p):
+    #     return self._correction_term_handle(self, p)
+    #
+    # def gradient_estimate(self, p):
+    #     return self._gradient_estimate_handle(self, p)
+
+    def save_parameters(self,zero_data=True):
+        
+        with torch.no_grad():
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+
+                    if p not in self.parameter_copy:
+                        self.parameter_copy[p] = torch.zeros_like(p.data)
+                    self.parameter_copy[p].copy_(p.data)
+                    if zero_data:
+                        p.data.zero_()
 
 
     def zero_grad(self):
@@ -50,33 +198,86 @@ class VA_wrapper():
         for group in self.optimizer.param_groups:
             group['lr'] = group['lr'] * scaling
 
-    def step(self, closure, fmin=None, fvar=0.0):
 
+    # def _get_delta_l(self):
+    #     """
+    #     Convenience function to get delta_l if step<M and otherwise
+    #     """
+    #     state = self.state
+    #     M = state['M']
+    #     if state['step'] < M:
+    #         delta_l = state['delta_acc'] / state['step']
+    #     else:
+    #         delta_l = state['delta_acc'] / M
+    #     return delta_l
+
+    
+
+    # def _initialize_deques(self, loss, inner_prod):
+    #     """
+    #     Initialize memory buffer to track last M losses and differences
+    #     """
+    #     state = self.state
+    #     M = state['M']
+    #     state['lastM_losses'] = deque([loss.item()] * M, M)
+    #     state['lastM_deltas'] = deque([0.0] * M, M)
+    #     state['lastM_deltas'].append(inner_prod.item())
+    #     state['delta_acc'] = torch.tensor(
+    #         inner_prod.item(), requires_grad=False)
+
+    #     state['l_acc'] = torch.tensor(M * loss.item(), requires_grad=False)
+
+    # def _update_deques(self, loss):
+    #     """ 
+    #     Update memory buffer
+    #     """
+    #     state = self.state
+    #     delta = abs(loss.item() - state['lastM_losses'][-1])
+    #     state['l_acc'] += loss.item() - state['lastM_losses'].popleft()
+    #     state['delta_acc'] += delta - state['lastM_deltas'].popleft()
+    #     state['lastM_losses'].append(loss.item())
+    #     # state['lastM_losses_squared'].append(loss**2)
+    #     state['lastM_deltas'].append(delta)
+
+    ##########
+    # Override step function
+    ###########
+
+    def step(self, closure, fmin=None, fvar=0.0):
+        # if loss is None:
+        #     raise RuntimeError('Loss is required for step')
+        self.inner_prod.zero_()
         loss=closure()
         f1 = loss.item()
+        # if torch.isnan(loss):
+        #     # return
+        #     raise ValueError("Loss is NaN")
 
         loss.backward()
-        R = fvar
+        # R = fvar
 
         state = self.state
+        # M = state['M']
 
         ############################
         # Save current parameter values and zero them afterwards
         # to use step functionality of optimizer for v=eta W g
         ############################
-
+        
+        self.save_parameters()
         # copy original data for parameters
-        originals = {}
-
-        for group in self.optimizer.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-
-                if p not in originals:
-                    originals[p] = torch.zeros_like(p.data)
-                originals[p].copy_(p.data)
-                p.data.zero_()
+        
+        # originals = {}
+        # with torch.no_grad():
+        #     for group in self.optimizer.param_groups:
+        #         for p in group['params']:
+        #             if p.grad is None:
+        #                 continue
+        #
+        #             if p not in originals:
+        #                 originals[p] = torch.zeros_like(p.data)
+        #             originals[p].copy_(p.data)
+        #             p.data.zero_()
 
 
         # step in optimizer direction go get lr*Wg
@@ -92,60 +293,86 @@ class VA_wrapper():
         # Calculate the inner product with gradient
         ############################
 
-        phi = torch.zeros(1, requires_grad=False)
+        # inner_prod = torch.zeros(1, requires_grad=False)
 
         for group in self.optimizer.param_groups:
+            # correction_term = self.correction_term(group)
             for p in group['params']:
                 if p.grad is None:
                     continue
 
+                # grad_estimate = self.gradient_estimate(p)
+
                 # p.data now contains the step i.e. v=-p.data
-                phi -= torch.sum(p.grad*p.data)
+                # inner_prod -= torch.sum(grad_estimate *
+                self.inner_prod -= torch.sum(p.grad *
+                                        p.data)#.div(correction_term) 
 
+        # # If first step:
+        # #   save information to use provided lr in first step
+        # if 'inner_prod' not in state:
+        #     state['inner_prod'] = inner_prod#.abs()
+        #     # self._initialize_deques(
+        #     #     loss=loss, inner_prod=state['inner_prod'] / 2)
+        # else:
+        #     state['inner_prod'] = inner_prod#.abs()
+        #     # self._update_deques(loss)
 
-        state['phi']=phi
+        # state['inner_prod'] = inner_prod
 
+        phi = self.inner_prod/2.0
 
-        if fmin is None:
-            df = phi/2.0
-        else:
-            df = f1-fmin
+        # Get mean of deltas
+        # delta_l = phi #self._get_delta_l()
 
+        # if fmin is None:
+        #     df = inner_prod/2.0    #phi 
+        # else:
+        #     df = f1-fmin
 
+        df = phi
+        # state['R'] = R.item()
         eps = state['eps']
 
         #########################
         #     Calculate step update
         #########################
-        step_modifier = 2.0 * \
-            (df / (phi + R + eps)).item()
 
+        # step_modifier = 2.0 * \
+        #     (df / (inner_prod  + eps)).item()
+        # step_modifier = 2.0 * \
+        #     (df / (inner_prod.abs() + R + eps)).item()
 
         # effective scaling of learning rate
-        state['step_modifier'] = step_modifier
+        # state['step_modifier'] = step_modifier
 
         ##################
         # Take updated optimizer step
         ##################
-        for group in self.optimizer.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                v = -p.data.clone()
-                p.data.copy_(originals[p])
-                p.data.add_(-step_modifier, v)
-
+        with torch.no_grad():
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    # v = -p.data.clone()
+                    # p.data.copy_(originals[p])
+                    # p.data.add_(-step_modifier, v)
+                    # p.data.add_(-step_modifier, self.parameter_copy[p])
+                    p.data.add_(self.parameter_copy[p])
 
         #######################
         # Update learning rate of optimizer
         #######################
+
         with torch.no_grad():
             f2 = closure().item()
 
-        delta_f = (f1-f2)
+        # print(f1,f2, df)
+
+        delta_f = (f1-f2)#*(1-0.9)
         state['delta_f'] = delta_f
 
-        frac = delta_f / (phi.item() / 2 + eps)
+        frac = delta_f / (self.inner_prod.item() / 2 + eps)
 
         if frac > 4/3:
             self.scale_learning_rate(scaling=state['upscale'])
@@ -155,6 +382,24 @@ class VA_wrapper():
             self.scale_learning_rate(scaling=state['downscale'])
             state['accumulated_scaling'] *= state['downscale']
 
+        # state['optimizer_lr'] = self.optimizer.param_groups[0]['lr']
+        if self.VERBOSE:
+
+            if phi.item()<0:
+                print('\033[91m'+f"f1: {f1:.2e}, f2: {f2:.2e}, f1-f2: {f1-f2:.2e}, phi: {phi.item():.2e}, df/phi:{frac:.2e}, lr:{state['accumulated_scaling'].item():.2e} "+ '\033[0m')
+            else:                
+                print(f"f1: {f1:.2e}, f2: {f2:.2e}, f1-f2: {f1-f2:.2e}, phi: {phi.item():.2e}, df/phi:{frac:.2e}, lr:{state['accumulated_scaling'].item():.2e} ")
+            
+
+
+            # print(f'dl:{df:.2e} - R:{state["R"]:2f}')
+            # print(
+            #     f"dl/vg:{frac:.3f}, step_l:{self.optimizer.param_groups[0]['lr'].item():.2e}")
+            # print(
+            #     f'step_sc:{step_modifier.item():.1e} vg:{state["inner_prod"].item():.1e} l:{loss.item():.2f} df:{df:.4f}')
+
+        # return f1 #closure
+        # return closure
         return loss
 
 
@@ -189,7 +434,10 @@ if __name__ == '__main__':
     M = 16
     M1 = 64
     O = 5
-
+    
+    lr = 0.1
+    X = 0.3*torch.randn(N, M).to(device)
+    Y = (5+torch.randn(N, O)).to(device)
     net = nn.Sequential(nn.Linear(M, M1), nn.ReLU(), nn.Linear(M1, O))
     net.to(device)
 
@@ -197,25 +445,23 @@ if __name__ == '__main__':
     criterion = nn.MSELoss(reduction='none')
 
     # optimizer = optim.SGD(net.parameters(), lr=0.01)#, momentum=0.9)
-    optimizer = optim.SGD(net.parameters(), lr=1, momentum=0.9)
-    # optimizer = optim.Adagrad(net.parameters(), lr=0.01)
-    # optimizer = optim.RMSprop(net.parameters(), lr=0.1)
+    optimizer = optim.SGD(net.parameters(), lr=lr, momentum=0.1)
+    # optimizer = optim.Adagrad(net.parameters(), lr=lr)
+    # optimizer = optim.RMSprop(net.parameters(), lr=lr)
     # optimizer = optim.Adam(net.parameters(), betas=(0.2,0.999),lr=0.001)
 
-    correction_term, grad_estimate_handle = get_optimizer_properties(
-        optimizer)
+    # correction_term, grad_estimate_handle = get_optimizer_properties(
+    #     optimizer)
 
-    va_optimizer = VA_wrapper(optimizer,verbose=True)
+    lr_optimizer = QuadraticAdaptation(optimizer,verbose=True)
     
     # print(va_optimizer)
     # print(va_optimizer.defaults)
 
     for i in range(5):        
-        X = 0.3*torch.randn(N, M).to(device)
-        Y = (5+torch.randn(N, O)).to(device)
 
         def closure():
-            va_optimizer.zero_grad()
+            lr_optimizer.zero_grad()
             # optimizer.zero_grad()
             outputs = net(X)
             batch_loss = criterion(outputs, Y)
@@ -226,5 +472,5 @@ if __name__ == '__main__':
 
 
 
-        va_optimizer.step(closure)
-        # va_optimizer.step(closure,fmin=torch.tensor([0.0],requires_grad=False))
+        lr_optimizer.step(closure)
+        # lr_optimizer.step(closure,fmin=torch.tensor([0.0],requires_grad=False))
