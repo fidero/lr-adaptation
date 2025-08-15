@@ -4,9 +4,6 @@ __pypackages__/
 *.py[cod]
 *$py.class
 
-# C extensions
-*.so
-
 # Distribution / packaging
 .Python
 build/
@@ -25,7 +22,6 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -39,18 +35,11 @@ pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 htmlcov/
-.tox/
-.nox/
 .coverage
 .coverage.*
 .cache
-nosetests.xml
 coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
 .pytest_cache/
-cover/
 pytest.xml
 
 # pyenv
@@ -59,10 +48,6 @@ pytest.xml
 # virtualenv
 .venv/
 venv/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
 
 # mkdocs documentation
 /site
