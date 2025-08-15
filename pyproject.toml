@@ -1,19 +1,18 @@
 [project]
-name = "lr-adaptation"
-version = "0.1.0"
-description = ""
 authors = [
-    {name = "fidero",email = "filip.de.roos@gmail.com"}
+  {name = "fidero", email = "filip.de.roos@gmail.com"},
+  {name = "famura", email = "noreply@famura.net"},
 ]
+dependencies = [
+    "torch>=2.7.1,<3.0.0",
+]
+description = ""
+name = "lr-adaptation"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
+version = "0.1.0"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
 ]
-
-[tool.poetry]
-packages = [{include = "lr_adaptation", from = "src"}]
-
-
-[build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
